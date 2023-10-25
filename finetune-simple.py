@@ -9,7 +9,6 @@ WANDB_PROJECT = "huggingface-mistral7b"
     gpu="A100",
     secret=Secret.from_name("my-wandb-secret"),
     timeout=60 * 60 * 4,
-    volumes=VOLUME_CONFIG,
     cloud="oci"
 )
 def finetune(model_name: str, resume_from_checkpoint: str = None):
