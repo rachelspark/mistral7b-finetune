@@ -1,3 +1,4 @@
+# This is a script that simplifies the finetuning process and has some debugging breaks, meant for repro purposes.
 from modal import Secret
 from transformers import TrainerCallback
 
