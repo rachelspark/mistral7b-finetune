@@ -196,6 +196,7 @@ def finetune(model_name: str, resume_from_checkpoint: str = None):
         model, type(model)
     )
 
+    # debugging
     for batch in trainer.get_train_dataloader():
         break
 
@@ -212,6 +213,7 @@ def finetune(model_name: str, resume_from_checkpoint: str = None):
     trainer.create_optimizer()
     trainer.optimizer.step()
     print("finished step")
+    # end debugging
 
     model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
     trainer.train()
