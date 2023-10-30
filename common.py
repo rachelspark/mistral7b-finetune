@@ -1,27 +1,25 @@
-from modal import Image, Stub, Volume, Secret
+from pathlib import Path
+from modal import Image, Stub, Volume, NetworkFileSystem, Secret
 
 BASE_MODEL = "mistralai/Mistral-7B-v0.1"
 
+MODEL_PATH = Path("/model")
 
-# def download_models():
-#     import torch
-#     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+def download_models():
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-#     bnb_config = BitsAndBytesConfig(
-#         load_in_4bit=True,
-#         bnb_4bit_use_double_quant=True,
-#         bnb_4bit_quant_type="nf4",
-#         bnb_4bit_compute_dtype=torch.bfloat16
-#     )
+    model = AutoModelForCausalLM.from_pretrained(BASE_MODEL)
+    model.save_pretrained(MODEL_PATH)
 
-#     AutoModelForCausalLM.from_pretrained(BASE_MODEL, quantization_config=bnb_config)
-#     tokenizer = AutoTokenizer.from_pretrained(
-#         BASE_MODEL,
-#         model_max_length=512,
-#         padding_side="left",
-#         add_eos_token=True
-#     )
-#     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained(
+        BASE_MODEL,
+        model_max_length=512,
+        padding_side="left",
+        add_eos_token=True
+    )
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.save_pretrained(MODEL_PATH)
 
 
 image = (
@@ -45,19 +43,16 @@ image = (
     .pip_install(
         "torch==2.0.1+cu118", index_url="https://download.pytorch.org/whl/cu118"
     )
-    # .pip_install("huggingface_hub==0.17.1", "hf-transfer==0.1.3")
-    # .env(dict(HUGGINGFACE_HUB_CACHE="/pretrained", HF_HUB_ENABLE_HF_TRANSFER="1"))
+    .run_function(download_models)
 )
 
+stub = Stub(name="example-mistral-7b-finetune", image=image)
 
-stub = Stub(name="example-mistral-7b-finetune", image=image, secrets=[Secret.from_name("huggingface")])
-
-stub.pretrained_volume = Volume.persisted("example-pretrained-vol")
-stub.results_volume = Volume.persisted("example-results-vol")
-
-model_store_path = "/vol/models"
+stub.training_data_volume = Volume.persisted("training-data-vol")
+# stub.pretrained_volume = Volume.persisted("pretrained-vol")
+stub.results_volume = Volume.persisted("results-vol")
 
 VOLUME_CONFIG = {
-    "/pretrained": stub.pretrained_volume,
+    "/training_data": stub.training_data_volume,
     "/results": stub.results_volume,
 }

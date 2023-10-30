@@ -1,10 +1,11 @@
 from modal import Secret
 from transformers import TrainerCallback
 
-from common import stub, BASE_MODEL, VOLUME_CONFIG
+from common import stub, BASE_MODEL, MODEL_PATH, VOLUME_CONFIG
 
-WANDB_PROJECT = "huggingface-mistral7b"
+WANDB_PROJECT = "hf-mistral7b-finetune"
 
+# Callback function to store model checkpoints in modal.Volume
 class CheckpointCallback(TrainerCallback):
     def __init__(self, volume):
         self.volume = volume
@@ -14,18 +15,24 @@ class CheckpointCallback(TrainerCallback):
             print("running commit on modal.Volume after model checkpoint")
             self.volume.commit()
 
+
 # @stub.function(
+#     gpu="A100",
 #     volumes=VOLUME_CONFIG,
 #     memory=1024 * 100,
 #     timeout=3600 * 4,
 # )
-# def download_model(model_name: str):
+# def download_pretrained(model_name: str):
+#     import torch
+#     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
 #     from huggingface_hub import snapshot_download
 #     from transformers.utils import move_cache
 
 #     try:
-#         file_path = snapshot_download(model_name, local_files_only=True)
-#         print(f"Volume contains {model_name} at {file_path}.")
+#         model_path = snapshot_download(model_name, local_files_only=True)
+#         print(f"Volume contains {model_name} at {model_path}.")
+
 #     except FileNotFoundError:
 #         print(f"Downloading {model_name} (no progress bar) ...")
 #         snapshot_download(model_name)
@@ -34,14 +41,31 @@ class CheckpointCallback(TrainerCallback):
 #         print("Committing /pretrained directory (no progress bar) ...")
 #         stub.pretrained_volume.commit()
 
+
+@stub.function(volumes=VOLUME_CONFIG)
+def download_dataset():
+    import os
+    from datasets import load_dataset
+
+    if not os.path.exists('/training_data/data_train.csv'):
+        dataset = load_dataset('gem/viggo')  # loading data from hugging face
+        for split, dataset in dataset.items():
+            dataset.to_csv(f"/training_data/data_{split}.csv")
+        
+    stub.training_data_volume.commit()
+
+
 @stub.function(
     gpu="A100",
-    secret=Secret.from_name("my-wandb-secret"),
-    timeout=60 * 60 * 4,
+    secret=Secret.from_name("my-wandb-secret") if WANDB_PROJECT else None,
+    timeout=60 * 60 * 2,
     volumes=VOLUME_CONFIG,
-    cloud="oci"
 )
-def finetune(model_name: str, resume_from_checkpoint: str = None):
+def finetune(
+    model_name: str, 
+    wandb_project: str = "", 
+    resume_from_checkpoint: str = None  # path to checkpoint (e.g. "/results/checkpoint-300/")
+):
     import os
     from datetime import datetime
 
@@ -57,25 +81,15 @@ def finetune(model_name: str, resume_from_checkpoint: str = None):
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     from datasets import load_dataset
 
-    train_dataset = load_dataset('gem/viggo', split='train')
-    eval_dataset = load_dataset('gem/viggo', split='validation')
-    test_dataset = load_dataset('gem/viggo', split='test')
-
-
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16
     )
-    
-    model = AutoModelForCausalLM.from_pretrained(BASE_MODEL, quantization_config=bnb_config, device_map="auto")
-    # except FileNotFoundError:
-    #     stub.pretrained_volume.reload()
-    #     model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=f"./pretrained", quantization_config=bnb_config, local_files_only=True)
-
+    model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, quantization_config=bnb_config)
     tokenizer = AutoTokenizer.from_pretrained(
-        BASE_MODEL,
+        MODEL_PATH,
         model_max_length=512,
         padding_side="left",
         add_eos_token=True,
@@ -108,11 +122,14 @@ def finetune(model_name: str, resume_from_checkpoint: str = None):
 
         return tokenize(full_prompt)
     
+    train_dataset = load_dataset('csv', data_files='/training_data/data_train.csv', split='train')
+    eval_dataset = load_dataset('csv', data_files='/training_data/data_validation.csv', split='train')
+    test_dataset = load_dataset('csv', data_files='/training_data/data_test.csv', split='train')
+    
     tokenized_train_dataset = train_dataset.map(generate_and_tokenize_prompt)
     tokenized_val_dataset = eval_dataset.map(generate_and_tokenize_prompt)
 
-    
-    # model.gradient_checkpointing_enable()
+    model.gradient_checkpointing_enable()
     model = prepare_model_for_kbit_training(model)
 
     config = LoraConfig(
@@ -132,10 +149,13 @@ def finetune(model_name: str, resume_from_checkpoint: str = None):
         lora_dropout=0.05,  # Conventional
         task_type="CAUSAL_LM",
     )
-
-
     model = get_peft_model(model, config)
-    model.to("cuda")
+
+    if len(wandb_project) > 0:
+        # Set environment variables if wandb enabled
+        os.environ["WANDB_PROJECT"] = wandb_project
+        os.environ["WANDB_WATCH"] = "gradients"
+        os.environ["WANDB_LOG_MODEL"] = "checkpoint"
 
     if resume_from_checkpoint:
         # Check the available weights and load them
@@ -159,10 +179,6 @@ def finetune(model_name: str, resume_from_checkpoint: str = None):
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
         model.is_parallelizable = True
         model.model_parallel = True
-    
-    os.environ["WANDB_PROJECT"] = "huggingface-mistral7b"
-    os.environ["WANDB_WATCH"] = "gradients"
-    os.environ["WANDB_LOG_MODEL"] = "checkpoint"
 
     trainer = transformers.Trainer(
         model=model,
@@ -170,20 +186,20 @@ def finetune(model_name: str, resume_from_checkpoint: str = None):
         eval_dataset=tokenized_val_dataset,
         callbacks=[CheckpointCallback(stub.results_volume)],
         args=transformers.TrainingArguments(
-            output_dir=f"/results",
-            warmup_steps=1,
+            output_dir="/results",
+            warmup_steps=5,
             per_device_train_batch_size=2,
-            gradient_accumulation_steps=1,
-            max_steps=5,
+            gradient_accumulation_steps=4,
+            max_steps=1000,
             learning_rate=2.5e-5, # Want about 10x smaller than the Mistral learning rate
-            logging_steps=1,
+            logging_steps=50,
             bf16=True,
-            optim="paged_adamw_8bit",
+            optim="adamw_8bit",
             logging_dir=f"/results/logs",        # Directory for storing logs
             save_strategy="steps",       # Save the model checkpoint every logging step
-            save_steps=1,                # Save checkpoints every 50 steps
+            save_steps=50,                # Save checkpoints every 50 steps
             evaluation_strategy="steps", # Evaluate the model every logging step
-            eval_steps=1,               # Evaluate and save checkpoints every 50 steps
+            eval_steps=50,               # Evaluate and save checkpoints every 50 steps
             do_eval=True,                # Perform evaluation at the end of training
             report_to="wandb",           # Comment this out if you don't want to use weights & baises
             run_name=f"mistral7b-finetune-{datetime.now().strftime('%Y-%m-%d-%H-%M')}"      
@@ -196,26 +212,7 @@ def finetune(model_name: str, resume_from_checkpoint: str = None):
         model, type(model)
     )
 
-    # debugging
-    for batch in trainer.get_train_dataloader():
-        break
-
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    batch = {k: v.to(device) for k, v in batch.items()}
-
-    outputs = trainer.model.to(device)(**batch)
-
-    print("calling backward() on loss")
-    loss = outputs.loss
-    loss.backward()
-
-    print("performing optimization step")
-    trainer.create_optimizer()
-    trainer.optimizer.step()
-    print("finished step")
-    # end debugging
-
-    model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
+    model.config.use_cache = False  # Silence the warnings. Re-enable for inference!
     trainer.train()
     
     model.save_pretrained(f"/results")
@@ -225,11 +222,12 @@ def finetune(model_name: str, resume_from_checkpoint: str = None):
 
 @stub.local_entrypoint()
 def main():
-    # print(f"Syncing base model {BASE_MODEL} to volume.")
-    # download.remote(BASE_MODEL)
+    # print(f"Downloading data from Hugging Face and syncing to volume.")
+    # download_dataset.remote()
 
-    print("Starting finetuning.")
-    finetune.remote(BASE_MODEL)
-    print("Done!")
+    print("Starting training run.")
+    finetune.remote(model_name=BASE_MODEL, wandb_project=WANDB_PROJECT)
+    print("Completed training!")
+    print("Run `modal run inference.py`")
 
 
